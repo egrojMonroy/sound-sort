@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sound Sort</title>
+  <meta name="description" content="Record or upload sounds, find their pitch, and keep one sorted library of all of them.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cg fill=%22%232a64d6%22%3E%3Crect x=%221%22 y=%2210%22 width=%222.5%22 height=%225%22/%3E%3Crect x=%225%22 y=%227%22 width=%222.5%22 height=%228%22/%3E%3Crect x=%229%22 y=%224%22 width=%222.5%22 height=%2211%22/%3E%3Crect x=%2213%22 y=%221%22 width=%222.5%22 height=%2214%22/%3E%3C/g%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+  <header class="top">
+    <h1>Sound Sort</h1>
+    <nav class="tabs">
+      <button type="button" data-tab="add" class="on">Add</button>
+      <button type="button" data-tab="library">Library <span id="libCount" class="count"></span></button>
+      <button type="button" data-tab="settings">Settings</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="tab-add">
+      <div class="card">
+        <h2>Microphone</h2>
+        <div class="readout" id="readout">
+          <div class="note" id="roNote">—</div>
+          <div class="hz" id="roHz">Tap Listen to see the pitch, or Record to capture sounds.</div>
+          <div class="alts" id="roAlts"></div>
+          <div class="meter"><div id="roLevel"></div></div>
+        </div>
+        <div class="row">
+          <button type="button" id="btnListen">Listen</button>
+          <button type="button" id="btnRecord" class="primary">● Record</button>
+          <span id="recTime" class="muted"></span>
+        </div>
+        <p class="hint">Record several sounds in one go, with a short silence between them. They are split afterwards.</p>
+      </div>
+
+      <div class="card">
+        <h2>Or upload a recording</h2>
+        <label class="button file">Choose a file<input type="file" id="fileInput" accept="audio/*,.wav,.m4a,.mp3,.flac,.ogg,.aac"></label>
+      </div>
+
+      <div class="card" id="review" hidden>
+        <h2><span id="foundCount">0</span> sounds found</h2>
+        <label class="field">Source name<input id="sourceName" autocomplete="off"></label>
+        <canvas id="wave" aria-label="Waveform. Tap a sound to hear it."></canvas>
+        <div class="sliders">
+          <label class="field">Silence threshold <output id="topDbOut"></output>
+            <input type="range" id="topDb" min="10" max="70" step="1" value="40"></label>
+          <label class="field">Join sounds closer than <output id="gapOut"></output>
+            <input type="range" id="minGap" min="20" max="1000" step="10" value="100"></label>
+          <label class="field">Keep tail <output id="tailOut"></output>
+            <input type="range" id="tail" min="0" max="1000" step="10" value="150"></label>
+        </div>
+        <p class="hint">Play each sound and tap the pitch you hear. A pitch you haven't confirmed shows a “?”.</p>
+        <p id="analysing" class="muted" hidden>Analysing…</p>
+        <ol id="slices" class="list"></ol>
+        <div class="row end">
+          <button type="button" id="btnDiscard">Discard</button>
+          <button type="button" id="btnAdd" class="primary">Add to library</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-library" hidden>
+      <div class="card">
+        <div class="row wrap">
+          <label class="field inline">Order<select id="orderSel"></select></label>
+          <label class="field inline">Source<select id="sourceSel"></select></label>
+        </div>
+        <div class="row wrap">
+          <button type="button" id="btnPlayAll">▶ Play in order</button>
+          <button type="button" id="btnSaveOrder">Save this order</button>
+          <button type="button" id="btnExport">Download zip</button>
+        </div>
+      </div>
+      <ol id="libList" class="list"></ol>
+      <p id="libEmpty" class="muted center">No sounds yet. Add some from the Add tab.</p>
+    </section>
+
+    <section id="tab-settings" hidden>
+      <div class="card">
+        <h2>Save to GitHub</h2>
+        <p>The library is saved in this site's own repository. To save from this browser, paste a GitHub token once:</p>
+        <ol class="steps">
+          <li>Open <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → new fine-grained token</a>.</li>
+          <li>Under <b>Repository access</b>, choose <b>Only select repositories</b> and pick this repository.</li>
+          <li>Under <b>Permissions → Contents</b>, choose <b>Read and write</b>.</li>
+          <li>Create it and paste it below.</li>
+        </ol>
+        <p class="hint">The token stays in this browser only. It is never saved in the repository.</p>
+        <label class="field">Owner<input id="ghOwner" autocomplete="off" autocapitalize="off"></label>
+        <label class="field">Repository<input id="ghRepo" autocomplete="off" autocapitalize="off"></label>
+        <label class="field">Branch<input id="ghBranch" autocomplete="off" autocapitalize="off"></label>
+        <label class="field">Token<input id="ghToken" type="password" autocomplete="off"></label>
+        <div class="row">
+          <button type="button" id="btnTest" class="primary">Save and test</button>
+          <button type="button" id="btnForget">Forget token</button>
+        </div>
+        <p id="ghStatus" class="muted"></p>
+      </div>
+    </section>
+  </main>
+
+  <div id="saveBar" hidden>
+    <span id="saveText"></span>
+    <button type="button" id="btnSave" class="primary">Save to GitHub</button>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

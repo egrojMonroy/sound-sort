@@ -35,7 +35,6 @@ const state = {
   pending: { added: [], edits: new Map(), deleted: new Set(), sorts: [] },
   wavs: new Map(), // pending sound id -> preview bytes
   previewUrls: new Map(), // sound id -> blob URL, for sounds the site hasn't published yet
-  review: null,
   tempId: 0,
   openId: null,
   playingId: null,
@@ -132,15 +131,18 @@ async function loadLibrary() {
   renderLibrary();
 }
 
-// ------------------------------------------------------------------ tabs
+// ------------------------------------------------------------------ settings panel
 
-function showTab(name) {
-  for (const button of document.querySelectorAll('.tabs button')) {
-    button.classList.toggle('on', button.dataset.tab === name);
-  }
-  for (const tab of ['add', 'library', 'settings']) $(`tab-${tab}`).hidden = tab !== name;
-  if (name === 'library') renderLibrary();
-  if (name === 'add') drawWave();
+function toggleSettings(open = $('settings').hidden) {
+  $('settings').hidden = !open;
+  $('btnSettings').setAttribute('aria-expanded', String(open));
+  if (open) $('settings').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function status(message, isError = false) {
+  const node = $('addStatus');
+  node.textContent = message;
+  node.classList.toggle('error', isError);
 }
 
 // ------------------------------------------------------------------ microphone
@@ -156,7 +158,7 @@ async function ensureMic() {
     requestAnimationFrame(readoutLoop);
     return true;
   } catch (e) {
-    toast(`Microphone unavailable: ${e.message}`, true);
+    status(`Microphone unavailable: ${e.message}`, true);
     return false;
   }
 }
@@ -179,7 +181,7 @@ function readoutLoop() {
   $('readout').classList.toggle('stale', now - lastReading > 1500);
   if (mic.recording) {
     const sec = (now - recordStart) / 1000;
-    $('recTime').textContent = `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}`;
+    status(`Recording… ${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, '0')}. Tap Stop when you're done.`);
   }
   requestAnimationFrame(readoutLoop);
 }
@@ -199,37 +201,41 @@ async function toggleRecord() {
     const { samples, sr } = mic.stopRecording();
     if (!listening) await mic.stop();
     $('btnRecord').textContent = '● Record';
-    $('recTime').textContent = '';
     if (samples.length < sr * 0.1) {
-      toast('The recording was too short.');
+      status('The recording was too short.', true);
       return;
     }
     const stamp = new Date().toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
-    startReview(samples, sr, null, `Recording ${stamp}`);
+    await addTake(samples, sr, null, `Recording ${stamp}`);
     return;
   }
-  if (state.review != null && !confirm('Discard the sounds you are reviewing?')) return;
   if (!(await ensureMic())) return;
   mic.startRecording();
   recordStart = performance.now();
   $('btnRecord').textContent = '■ Stop';
 }
 
-async function onFile(e) {
-  const file = e.target.files[0];
+async function onFiles(e) {
+  const files = [...e.target.files];
   e.target.value = '';
-  if (file == null) return;
-  if (state.review != null && !confirm('Discard the sounds you are reviewing?')) return;
-  toast(`Reading ${file.name}…`);
-  try {
-    const { samples, sr } = await decodeFile(file);
-    startReview(samples, sr, file.name, file.name.replace(/\.[^.]+$/, ''));
-  } catch (err) {
-    toast(`This browser can't read ${file.name}: ${err.message}`, true);
+  for (const [i, file] of files.entries()) {
+    const which = files.length > 1 ? ` (${i + 1} of ${files.length})` : '';
+    status(`Reading ${file.name}${which}…`);
+    try {
+      const { samples, sr } = await decodeFile(file);
+      await addTake(samples, sr, file.name, file.name.replace(/\.[^.]+$/, ''));
+    } catch (err) {
+      status(`This browser can't read ${file.name}: ${err.message}`, true);
+      return;
+    }
   }
 }
 
 // ------------------------------------------------------------------ review
+
+// Each recording or file is one take. Its sounds wait here until you add them.
+const takes = [];
+let takeCount = 0;
 
 function params() {
   return {
@@ -247,31 +253,67 @@ function showParams() {
   $('tailOut').textContent = `${$('tail').value} ms`;
 }
 
-function startReview(samples, sr, sourceFile, sourceName) {
-  state.review = { samples, sr, sourceFile, slices: [], cache: new Map(), generation: 0 };
-  $('sourceName').value = sourceName;
-  $('review').hidden = false;
-  showTab('add');
-  resplit();
-  $('review').scrollIntoView({ behavior: 'smooth', block: 'start' });
+function updateReviewSummary() {
+  const all = takes.flatMap((t) => t.slices);
+  const kept = all.filter((s) => s.keep).length;
+  $('review').hidden = takes.length === 0;
+  $('btnAdd').textContent = `Add ${kept} sound${kept === 1 ? '' : 's'} to library`;
+  $('btnAdd').disabled = kept === 0;
 }
 
-async function resplit() {
-  const review = state.review;
-  if (review == null) return;
-  const generation = ++review.generation;
-  const regions = findSounds(review.samples, review.sr, params());
-  const previous = new Map(review.slices.map((s) => [s.start, s]));
-  $('analysing').hidden = false;
+async function addTake(samples, sr, sourceFile, source) {
+  const take = { id: ++takeCount, samples, sr, sourceFile, slices: [], cache: new Map(), generation: 0 };
+  const nameInput = el('input', { value: source, autocomplete: 'off', 'aria-label': 'Source name' });
+  nameInput.addEventListener('input', () => {
+    for (const [i, input] of [...take.list.querySelectorAll('.name')].entries()) input.placeholder = defaultName(take, i);
+  });
+  take.nameInput = nameInput;
+  take.canvas = el('canvas', { className: 'wave', 'aria-label': 'Waveform. Tap a sound to hear it.' });
+  take.canvas.addEventListener('click', (e) => {
+    const box = take.canvas.getBoundingClientRect();
+    const at = ((e.clientX - box.left) / box.width) * take.samples.length;
+    const index = take.slices.findIndex((s) => at >= s.start && at < s.end);
+    if (index >= 0) playSlice(take, take.slices[index], take.list.children[index]);
+  });
+  take.info = el('p', { className: 'muted' });
+  take.list = el('ol', { className: 'list' });
+  take.node = el('div', { className: 'take' },
+    el('div', { className: 'take-head' },
+      el('label', { className: 'field' }, 'Source name', nameInput),
+      el('button', { type: 'button', textContent: 'Remove', onclick: () => removeTake(take) })),
+    take.canvas, take.info, take.list);
+  takes.push(take);
+  $('takes').append(take.node);
+  updateReviewSummary();
+  await analyseTake(take);
+  if (takes.includes(take)) take.node.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function removeTake(take) {
+  stopPlayback();
+  take.generation++;
+  takes.splice(takes.indexOf(take), 1);
+  take.node.remove();
+  updateReviewSummary();
+}
+
+async function analyseTake(take) {
+  const generation = ++take.generation;
+  const regions = findSounds(take.samples, take.sr, params());
+  const previous = new Map(take.slices.map((s) => [s.start, s]));
+  const name = take.nameInput.value;
   const slices = [];
   for (const [i, [start, end]] of regions.entries()) {
     const key = `${start}:${end}`;
-    let analysis = review.cache.get(key);
+    let analysis = take.cache.get(key);
     if (analysis == null) {
-      if (i % 4 === 0) await new Promise((r) => setTimeout(r)); // keep the page responsive
-      if (generation !== review.generation) return;
-      analysis = analyse(review.samples.subarray(start, end), review.sr);
-      review.cache.set(key, analysis);
+      if (i % 4 === 0) {
+        status(`Finding the pitch in ${name}: ${i + 1} of ${regions.length}…`);
+        await new Promise((r) => setTimeout(r)); // keep the page responsive
+      }
+      if (generation !== take.generation) return;
+      analysis = analyse(take.samples.subarray(start, end), take.sr);
+      take.cache.set(key, analysis);
     }
     // A sound that starts at the same place keeps what you already chose for it.
     const old = previous.get(start);
@@ -285,39 +327,45 @@ async function resplit() {
       name: old?.name ?? '',
     });
   }
-  if (generation !== review.generation) return;
-  review.slices = slices;
-  $('analysing').hidden = true;
-  $('foundCount').textContent = String(slices.length);
-  drawWave();
-  renderSlices();
+  if (generation !== take.generation) return;
+  take.slices = slices;
+  const seconds = (take.samples.length / take.sr).toFixed(1);
+  take.info.textContent = slices.length === 1
+    ? `${seconds} s · 1 sound.`
+    : `${seconds} s · split into ${slices.length} sounds at the silences.`;
+  drawWave(take);
+  take.list.replaceChildren(...slices.map((_, i) => sliceRow(take, i)));
+  updateReviewSummary();
+  status(`${name}: ${slices.length} sound${slices.length === 1 ? '' : 's'} ready below. Check each pitch, then add them to the library.`);
 }
 
-function defaultName(index) {
-  return `${$('sourceName').value.trim() || 'Sound'} ${String(index + 1).padStart(2, '0')}`;
+function resplitAll() {
+  for (const take of takes) analyseTake(take);
 }
 
-function drawWave() {
-  const review = state.review;
-  const canvas = $('wave');
-  if (review == null || canvas.clientWidth === 0) return;
+function defaultName(take, index) {
+  const source = take.nameInput.value.trim() || 'Sound';
+  return take.slices.length === 1 ? source : `${source} ${String(index + 1).padStart(2, '0')}`;
+}
+
+function drawWave(take) {
+  const canvas = take.canvas;
+  if (canvas.clientWidth === 0) return;
   const ratio = window.devicePixelRatio ?? 1;
   canvas.width = canvas.clientWidth * ratio;
   canvas.height = canvas.clientHeight * ratio;
   const g = canvas.getContext('2d');
   const css = getComputedStyle(document.documentElement);
   const { width, height } = canvas;
-  const x = review.samples;
+  const x = take.samples;
   const perPx = x.length / width;
   g.clearRect(0, 0, width, height);
   g.fillStyle = css.getPropertyValue('--region');
-  for (const s of review.slices) {
-    if (!s.keep) continue;
-    const a = s.start / perPx;
-    g.fillRect(a, 0, Math.max(1, (s.end - s.start) / perPx), height);
+  for (const s of take.slices) {
+    if (s.keep) g.fillRect(s.start / perPx, 0, Math.max(1, (s.end - s.start) / perPx), height);
   }
   g.fillStyle = css.getPropertyValue('--region-line');
-  for (const s of review.slices) if (s.keep) g.fillRect(s.start / perPx, 0, ratio, height);
+  for (const s of take.slices) if (s.keep) g.fillRect(s.start / perPx, 0, ratio, height);
   let peak = 1e-6;
   for (let i = 0; i < x.length; i += 7) peak = Math.max(peak, Math.abs(x[i]));
   g.fillStyle = css.getPropertyValue('--wave');
@@ -348,25 +396,19 @@ function pitchChips(candidates, chosenHz, confirmed, onPick) {
   }));
 }
 
-function playSlice(slice, row) {
-  const review = state.review;
+function playSlice(take, slice, row) {
   row?.classList.add('playing');
-  playSamples(review.samples.subarray(slice.start, slice.end), review.sr, () => row?.classList.remove('playing'));
+  playSamples(take.samples.subarray(slice.start, slice.end), take.sr, () => row?.classList.remove('playing'));
 }
 
-function renderSlices() {
-  $('slices').replaceChildren(...state.review.slices.map((_, i) => sliceRow(i)));
-}
-
-function sliceRow(i) {
-  const review = state.review;
-  const s = review.slices[i];
+function sliceRow(take, i) {
+  const s = take.slices[i];
   const row = el('li', { className: `item${s.keep ? '' : ' off'}` });
-  const rerender = () => row.replaceWith(sliceRow(i));
+  const rerender = () => row.replaceWith(sliceRow(take, i));
   const name = el('input', {
     className: 'name',
     value: s.name,
-    placeholder: defaultName(i),
+    placeholder: defaultName(take, i),
     'aria-label': 'Name',
     oninput: (e) => (s.name = e.target.value),
   });
@@ -376,15 +418,16 @@ function sliceRow(i) {
     onchange: (e) => {
       s.keep = e.target.checked;
       row.classList.toggle('off', !s.keep);
-      drawWave();
+      drawWave(take);
+      updateReviewSummary();
     },
   });
   row.append(
-    el('button', { type: 'button', className: 'play', textContent: '▶', 'aria-label': 'Play', onclick: () => playSlice(s, row) }),
+    el('button', { type: 'button', className: 'play', textContent: '▶', 'aria-label': 'Play', onclick: () => playSlice(take, s, row) }),
     el('div', { className: 'main' },
       el('div', { className: 'line1' },
         el('b', { textContent: `#${i + 1} ` }),
-        `${(s.start / review.sr).toFixed(2)} s · ${((s.end - s.start) / review.sr).toFixed(2)} s `,
+        `${(s.start / take.sr).toFixed(2)} s · ${((s.end - s.start) / take.sr).toFixed(2)} s `,
         s.confirmed ? null : el('span', { className: 'q', textContent: '?' })),
       s.analysis.candidates.length > 0
         ? pitchChips(s.analysis.candidates, s.pitchHz, s.confirmed, (hz) => {
@@ -399,29 +442,22 @@ function sliceRow(i) {
   return row;
 }
 
-function discardReview() {
+function clearTakes() {
   stopPlayback();
-  state.review = null;
-  $('review').hidden = true;
-  $('slices').replaceChildren();
+  for (const take of [...takes]) removeTake(take);
 }
 
-async function addReviewToLibrary() {
-  const review = state.review;
-  const kept = review.slices.map((s, i) => ({ s, i })).filter(({ s }) => s.keep);
-  if (kept.length === 0) {
-    toast('No sounds are marked Keep.');
-    return;
-  }
-  const source = $('sourceName').value.trim() || 'Untitled';
+async function addTakesToLibrary() {
+  const kept = takes.flatMap((take) => take.slices.map((s, i) => ({ take, s, i })).filter(({ s }) => s.keep));
+  if (kept.length === 0) return;
   const button = $('btnAdd');
   button.disabled = true;
   const known = new Set(view().sounds.map((s) => s.hash));
   let skipped = 0;
   try {
-    for (const [n, { s, i }] of kept.entries()) {
-      button.textContent = `Adding ${n + 1}/${kept.length}…`;
-      const wav = await makePreview(review.samples.subarray(s.start, s.end), review.sr);
+    for (const [n, { take, s, i }] of kept.entries()) {
+      button.textContent = `Adding ${n + 1} of ${kept.length}…`;
+      const wav = await makePreview(take.samples.subarray(s.start, s.end), take.sr);
       const hash = await sha256Hex(wav);
       if (known.has(hash)) {
         skipped++;
@@ -433,12 +469,12 @@ async function addReviewToLibrary() {
       state.previewUrls.set(id, URL.createObjectURL(new Blob([wav], { type: 'audio/wav' })));
       state.pending.added.push({
         id,
-        name: s.name.trim() || `${source} ${String(i + 1).padStart(2, '0')}`,
-        source,
-        sourceFile: review.sourceFile,
-        startSec: round(s.start / review.sr, 3),
-        endSec: round(s.end / review.sr, 3),
-        durationSec: round((s.end - s.start) / review.sr, 3),
+        name: s.name.trim() || defaultName(take, i),
+        source: take.nameInput.value.trim() || 'Untitled',
+        sourceFile: take.sourceFile,
+        startSec: round(s.start / take.sr, 3),
+        endSec: round(s.end / take.sr, 3),
+        durationSec: round((s.end - s.start) / take.sr, 3),
         added: today(),
         pitchHz: round(s.pitchHz, 2),
         pitchConfirmed: s.confirmed,
@@ -451,17 +487,18 @@ async function addReviewToLibrary() {
     }
   } finally {
     button.disabled = false;
-    button.textContent = 'Add to library';
+    updateReviewSummary();
   }
   const added = kept.length - skipped;
   if (added === 0) {
-    toast(`All ${skipped} sounds are already in the library.`);
+    status(`All ${skipped} sounds are already in the library.`);
     return;
   }
-  discardReview();
+  clearTakes();
   renderLibrary();
-  showTab('library');
-  toast(`${added} sound${added === 1 ? '' : 's'} added${skipped > 0 ? `, ${skipped} already in the library` : ''}. Save to keep them.`);
+  const also = skipped > 0 ? ` ${skipped} were already there.` : '';
+  status(`${added} sound${added === 1 ? '' : 's'} added to the library.${also} Tap “Save to GitHub” to keep them.`);
+  $('library').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // ------------------------------------------------------------------ library
@@ -666,7 +703,7 @@ function stringifyLibrary(doc) {
 async function save() {
   const gh = repo();
   if (gh == null) {
-    showTab('settings');
+    toggleSettings(true);
     toast('Add a GitHub token first.');
     return;
   }
@@ -710,7 +747,7 @@ async function save() {
   toast('Saved to GitHub.');
 }
 
-// ------------------------------------------------------------------ settings tab
+// ------------------------------------------------------------------ settings
 
 function showSettings() {
   $('ghOwner').value = settings.owner;
@@ -754,33 +791,20 @@ function forgetToken() {
 // ------------------------------------------------------------------ wiring
 
 function init() {
-  for (const button of document.querySelectorAll('.tabs button')) {
-    button.addEventListener('click', () => showTab(button.dataset.tab));
-  }
+  $('btnSettings').addEventListener('click', () => toggleSettings());
   $('btnListen').addEventListener('click', toggleListen);
   $('btnRecord').addEventListener('click', toggleRecord);
-  $('fileInput').addEventListener('change', onFile);
+  $('fileInput').addEventListener('change', onFiles);
 
   for (const id of ['topDb', 'minGap', 'tail']) {
     $(id).addEventListener('input', showParams);
-    $(id).addEventListener('change', resplit);
+    $(id).addEventListener('change', resplitAll);
   }
   showParams();
-  $('sourceName').addEventListener('input', () => {
-    for (const [i, input] of [...$('slices').querySelectorAll('.name')].entries()) input.placeholder = defaultName(i);
+  $('btnClear').addEventListener('click', () => {
+    if (confirm('Remove all the sounds waiting to be added?')) clearTakes();
   });
-  $('wave').addEventListener('click', (e) => {
-    const review = state.review;
-    if (review == null) return;
-    const box = e.currentTarget.getBoundingClientRect();
-    const at = ((e.clientX - box.left) / box.width) * review.samples.length;
-    const index = review.slices.findIndex((s) => at >= s.start && at < s.end);
-    if (index >= 0) playSlice(review.slices[index], $('slices').children[index]);
-  });
-  $('btnDiscard').addEventListener('click', () => {
-    if (confirm('Discard these sounds?')) discardReview();
-  });
-  $('btnAdd').addEventListener('click', addReviewToLibrary);
+  $('btnAdd').addEventListener('click', addTakesToLibrary);
 
   $('orderSel').addEventListener('change', renderLibrary);
   $('sourceSel').addEventListener('change', renderLibrary);
@@ -793,9 +817,9 @@ function init() {
   $('btnForget').addEventListener('click', forgetToken);
   showSettings();
 
-  window.addEventListener('resize', drawWave);
+  window.addEventListener('resize', () => takes.forEach(drawWave));
   window.addEventListener('beforeunload', (e) => {
-    if (pendingCount() > 0 || state.review != null || mic.recording) e.preventDefault();
+    if (pendingCount() > 0 || takes.length > 0 || mic.recording) e.preventDefault();
   });
 
   loadLibrary();

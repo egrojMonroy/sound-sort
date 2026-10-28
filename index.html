@@ -6,9 +6,9 @@
   <title>Sound Sort</title>
   <meta name="description" content="Record or upload sounds, find their pitch, and keep one sorted library of all of them.">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cg fill=%22%232a64d6%22%3E%3Crect x=%221%22 y=%2210%22 width=%222.5%22 height=%225%22/%3E%3Crect x=%225%22 y=%227%22 width=%222.5%22 height=%228%22/%3E%3Crect x=%229%22 y=%224%22 width=%222.5%22 height=%2211%22/%3E%3Crect x=%2213%22 y=%221%22 width=%222.5%22 height=%2214%22/%3E%3C/g%3E%3C/svg%3E">
-  <link rel="stylesheet" href="style.css?v=5">
+  <link rel="stylesheet" href="style.css?v=6">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" defer></script>
-  <script type="module" src="js/app.js?v=5"></script>
+  <script type="module" src="js/app.js?v=6"></script>
   <script>
     // Plain script, so it still runs when the app's code can't: says why nothing works instead of staying silent.
     (function () {
@@ -118,10 +118,18 @@
           <label class="field inline">Order<select id="orderSel"></select></label>
           <label class="field inline">Source<select id="sourceSel"></select></label>
         </div>
-        <div class="row wrap">
+        <div class="row wrap" id="libActions">
           <button type="button" id="btnPlayAll">▶ Play in order</button>
           <button type="button" id="btnSaveOrder">Save this order</button>
           <button type="button" id="btnExport">Download zip</button>
+          <button type="button" id="btnSelect">Select…</button>
+          <button type="button" id="btnClearLib" class="danger">Clear library</button>
+        </div>
+        <div class="row wrap" id="selectBar" hidden>
+          <span id="selectCount" class="muted"></span>
+          <button type="button" id="btnSelectAll">Select all</button>
+          <button type="button" id="btnRemoveSelected" class="danger">Remove selected</button>
+          <button type="button" id="btnSelectCancel">Cancel</button>
         </div>
       </div>
       <ol id="libList" class="list"></ol>
@@ -131,7 +139,10 @@
 
   <div id="saveBar" hidden>
     <span id="saveText"></span>
-    <button type="button" id="btnSave" class="primary">Save to GitHub</button>
+    <span class="save-actions">
+      <button type="button" id="btnDiscard">Discard</button>
+      <button type="button" id="btnSave" class="primary">Save to GitHub</button>
+    </span>
   </div>
   <div id="toast" role="status" aria-live="polite"></div>
 </body>

@@ -1,6 +1,6 @@
 // Microphone, file decoding, preview encoding and playback.
 
-import { aWeightDb, pickPeaks, toMono } from './dsp.js?v=5';
+import { aWeightDb, pickPeaks, toMono } from './dsp.js?v=6';
 
 export const PREVIEW_SR = 24000;
 const FADE_SEC = 0.005;

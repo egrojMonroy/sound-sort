@@ -1,6 +1,6 @@
-import { analyse, findSounds, formatNote } from './dsp.js?v=5';
-import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=5';
-import { Repo } from './github.js?v=5';
+import { analyse, findSounds, formatNote } from './dsp.js?v=6';
+import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=6';
+import { Repo } from './github.js?v=6';
 
 const LIBRARY_PATH = 'library/sounds.json';
 const SETTINGS_KEY = 'sound-sort.github';
@@ -38,6 +38,8 @@ const state = {
   tempId: 0,
   openId: null,
   playingId: null,
+  selecting: false,
+  selected: new Set(),
 };
 
 const pendingCount = () =>
@@ -57,10 +59,9 @@ function merge(base, pending, assignIds) {
     doc.sounds.push({ ...s, ...(pending.edits.get(s.id) ?? {}), id, preview: `library/previews/${id}.wav` });
   }
   const known = new Set(doc.sounds.map((s) => s.id));
-  doc.sorts = [
-    ...doc.sorts,
-    ...pending.sorts.map((o) => ({ ...o, ids: o.ids.map((i) => idMap.get(i) ?? i).filter((i) => known.has(i)) })),
-  ];
+  doc.sorts = [...doc.sorts, ...pending.sorts]
+    .map((o) => ({ ...o, ids: o.ids.map((i) => idMap.get(i) ?? i).filter((i) => known.has(i)) }))
+    .filter((o) => o.ids.length > 0);
   return { doc, idMap };
 }
 
@@ -71,16 +72,56 @@ function editSound(id, fields) {
   renderLibrary();
 }
 
-function deleteSound(id) {
-  const added = state.pending.added.findIndex((s) => s.id === id);
-  if (added >= 0) {
-    state.pending.added.splice(added, 1);
-    state.wavs.delete(id);
-  } else {
-    state.pending.deleted.add(id);
+// Sounds not saved yet disappear at once; saved ones are removed from GitHub on the next save.
+function removeSounds(ids) {
+  const remove = new Set(ids);
+  for (const s of state.pending.added.filter((a) => remove.has(a.id))) {
+    state.wavs.delete(s.id);
+    remove.delete(s.id);
   }
-  state.pending.edits.delete(id);
+  state.pending.added = state.pending.added.filter((a) => !ids.includes(a.id));
+  for (const id of remove) state.pending.deleted.add(id);
+  for (const id of ids) {
+    state.pending.edits.delete(id);
+    state.selected.delete(id);
+  }
+  if (ids.includes(state.openId)) state.openId = null;
   renderLibrary();
+}
+
+function discardChanges() {
+  if (!confirm(`Undo all ${pendingCount()} unsaved changes? The library goes back to how it was last saved.`)) return;
+  for (const s of state.pending.added) URL.revokeObjectURL(state.previewUrls.get(s.id));
+  state.pending = { added: [], edits: new Map(), deleted: new Set(), sorts: [] };
+  state.wavs.clear();
+  state.selected.clear();
+  state.openId = null;
+  renderLibrary();
+  toast('Unsaved changes undone.');
+}
+
+function setSelecting(on) {
+  state.selecting = on;
+  state.selected.clear();
+  renderLibrary();
+}
+
+function removeSelected() {
+  const ids = [...state.selected];
+  if (ids.length === 0) return;
+  if (!confirm(`Remove ${ids.length} sound${ids.length === 1 ? '' : 's'} from the library?`)) return;
+  removeSounds(ids);
+  setSelecting(false);
+  toast(`${ids.length} removed. Save to GitHub to make it permanent, or Discard to undo.`);
+}
+
+function clearLibrary() {
+  const ids = view().sounds.map((s) => s.id);
+  if (ids.length === 0) return;
+  if (!confirm(`Remove all ${ids.length} sounds from the library?`)) return;
+  removeSounds(ids);
+  setSelecting(false);
+  toast('Library cleared. Save to GitHub to make it permanent, or Discard to undo.');
 }
 
 // ------------------------------------------------------------------ settings
@@ -710,6 +751,13 @@ function renderLibrary() {
   fillSelect($('sourceSel'), [['', 'All sources'], ...sources.map((s) => [s, s])]);
   const sounds = sortedSounds(doc);
   $('libList').replaceChildren(...sounds.map((s, i) => libraryRow(s, i)));
+  $('libList').classList.toggle('selecting', state.selecting);
+  $('selectBar').hidden = !state.selecting;
+  $('libActions').hidden = state.selecting;
+  $('selectCount').textContent = `${state.selected.size} selected`;
+  $('btnRemoveSelected').disabled = state.selected.size === 0;
+  $('btnSelect').disabled = doc.sounds.length === 0;
+  $('btnClearLib').disabled = doc.sounds.length === 0;
   $('libEmpty').hidden = sounds.length > 0;
   $('libCount').textContent = doc.sounds.length > 0 ? String(doc.sounds.length) : '';
   const changes = pendingCount();
@@ -719,10 +767,23 @@ function renderLibrary() {
 
 function libraryRow(s, index) {
   const open = state.openId === s.id;
-  const row = el('li', { className: `item${state.playingId === s.id ? ' playing' : ''}` });
+  const selected = state.selected.has(s.id);
+  const row = el('li', { className: `item${state.playingId === s.id ? ' playing' : ''}${selected ? ' selected' : ''}` });
   row.dataset.id = s.id;
+  const toggle = () => {
+    if (selected) state.selected.delete(s.id);
+    else state.selected.add(s.id);
+    renderLibrary();
+  };
+  if (state.selecting) {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.play') == null && e.target.type !== 'checkbox') toggle();
+    });
+  }
   row.append(
-    el('span', { className: 'rank', textContent: String(index + 1) }),
+    state.selecting
+      ? el('input', { type: 'checkbox', className: 'pick', checked: selected, 'aria-label': `Select ${s.name}`, onchange: toggle })
+      : el('span', { className: 'rank', textContent: String(index + 1) }),
     el('button', { type: 'button', className: 'play', textContent: '▶', 'aria-label': 'Play', onclick: () => playOne(s) }),
     el('div', { className: 'main' },
       el('div', { className: 'line1' },
@@ -738,7 +799,7 @@ function libraryRow(s, index) {
           s.id.startsWith('new-') ? 'not saved yet' : s.id,
         ].filter((x) => x != null).join(' · '),
       })),
-    el('button', {
+    state.selecting ? el('span') : el('button', {
       type: 'button',
       textContent: open ? 'Close' : 'Edit',
       onclick: () => {
@@ -747,7 +808,7 @@ function libraryRow(s, index) {
       },
     }),
   );
-  if (open) row.append(libraryDetails(s));
+  if (open && !state.selecting) row.append(libraryDetails(s));
   return row;
 }
 
@@ -768,9 +829,9 @@ function libraryDetails(s) {
       el('button', {
         type: 'button',
         className: 'danger',
-        textContent: 'Delete',
+        textContent: 'Remove',
         onclick: () => {
-          if (confirm(`Delete “${s.name}” from the library?`)) deleteSound(s.id);
+          if (confirm(`Remove “${s.name}” from the library?`)) removeSounds([s.id]);
         },
       })),
   );
@@ -983,6 +1044,20 @@ function init() {
   $('btnSaveOrder').addEventListener('click', saveOrder);
   $('btnExport').addEventListener('click', exportZip);
   $('btnSave').addEventListener('click', save);
+  $('btnDiscard').addEventListener('click', discardChanges);
+  $('btnSelect').addEventListener('click', () => setSelecting(true));
+  $('btnSelectCancel').addEventListener('click', () => setSelecting(false));
+  $('btnSelectAll').addEventListener('click', () => {
+    const visible = sortedSounds(view()).map((s) => s.id);
+    const all = visible.every((id) => state.selected.has(id));
+    for (const id of visible) {
+      if (all) state.selected.delete(id);
+      else state.selected.add(id);
+    }
+    renderLibrary();
+  });
+  $('btnRemoveSelected').addEventListener('click', removeSelected);
+  $('btnClearLib').addEventListener('click', clearLibrary);
 
   $('btnTest').addEventListener('click', testSettings);
   $('btnForget').addEventListener('click', forgetToken);

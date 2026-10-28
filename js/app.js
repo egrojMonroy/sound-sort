@@ -1,6 +1,6 @@
-import { analyse, findSounds, formatNote } from './dsp.js?v=4';
-import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=4';
-import { Repo } from './github.js?v=4';
+import { analyse, findSounds, formatNote } from './dsp.js?v=5';
+import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=5';
+import { Repo } from './github.js?v=5';
 
 const LIBRARY_PATH = 'library/sounds.json';
 const SETTINGS_KEY = 'sound-sort.github';
@@ -303,7 +303,10 @@ function removeTake(take) {
 
 async function analyseTake(take) {
   const generation = ++take.generation;
-  const regions = findSounds(take.samples, take.sr, params());
+  // Sounds you trimmed by hand stay as they are; new splitting fills in around them.
+  const trimmed = take.slices.filter((s) => s.trimmed);
+  const regions = findSounds(take.samples, take.sr, params())
+    .filter(([a, b]) => !trimmed.some((t) => a < t.end && b > t.start));
   const previous = new Map(take.slices.map((s) => [s.start, s]));
   const name = take.nameInput.value;
   const slices = [];
@@ -332,15 +335,16 @@ async function analyseTake(take) {
     });
   }
   if (generation !== take.generation) return;
-  take.slices = slices;
+  take.slices = [...slices, ...trimmed].sort((a, b) => a.start - b.start);
+  take.editing = null;
   const seconds = (take.samples.length / take.sr).toFixed(1);
-  take.info.textContent = slices.length === 1
+  take.info.textContent = take.slices.length === 1
     ? `${seconds} s · 1 sound.`
-    : `${seconds} s · split into ${slices.length} sounds at the silences.`;
+    : `${seconds} s · split into ${take.slices.length} sounds at the silences.`;
   drawWave(take);
-  take.list.replaceChildren(...slices.map((_, i) => sliceRow(take, i)));
+  take.list.replaceChildren(...take.slices.map((_, i) => sliceRow(take, i)));
   updateReviewSummary();
-  status(`${name}: ${slices.length} sound${slices.length === 1 ? '' : 's'} ready below. Check each pitch, then add them to the library.`);
+  status(`${name}: ${take.slices.length} sound${slices.length === 1 ? '' : 's'} ready below. Check each pitch, then add them to the library.`);
 }
 
 function resplitAll() {
@@ -405,9 +409,154 @@ function playSlice(take, slice, row) {
   playSamples(take.samples.subarray(slice.start, slice.end), take.sr, () => row?.classList.remove('playing'));
 }
 
+const MIN_SOUND_SEC = 0.02;
+const NUDGE_SEC = 0.005;
+
+// New boundaries mean a new spectrum. Keep the chosen pitch if it is still one of the candidates.
+function reanalyseSlice(take, s) {
+  const analysis = analyse(take.samples.subarray(s.start, s.end), take.sr);
+  const same = s.pitchHz == null
+    ? null
+    : analysis.candidates.find((c) => Math.abs(12 * Math.log2(c.hz / s.pitchHz)) < 0.5);
+  s.analysis = analysis;
+  s.pitchHz = same?.hz ?? analysis.candidates[0]?.hz ?? null;
+  s.confirmed = same != null && s.confirmed;
+  s.trimmed = true;
+}
+
+// Zoomed waveform of one sound with draggable start and end handles.
+function trimEditor(take, i, row) {
+  const s = take.slices[i];
+  const sr = take.sr;
+  const lo = i > 0 ? take.slices[i - 1].end : 0;
+  const hi = i + 1 < take.slices.length ? take.slices[i + 1].start : take.samples.length;
+  const pad = Math.max(Math.round(0.3 * sr), Math.round((s.end - s.start) * 0.5));
+  const view = { a: Math.max(0, s.start - pad), b: Math.min(take.samples.length, s.end + pad) };
+  const minLen = Math.round(MIN_SOUND_SEC * sr);
+  const canvas = el('canvas', { className: 'trim', 'aria-label': 'Drag the handles to move the start and end' });
+  const times = el('div', { className: 'trim-times' });
+  const toX = (sample) => ((sample - view.a) / (view.b - view.a)) * canvas.clientWidth;
+  const toSample = (x) => Math.round(view.a + (x / canvas.clientWidth) * (view.b - view.a));
+
+  function draw() {
+    const ratio = window.devicePixelRatio ?? 1;
+    canvas.width = canvas.clientWidth * ratio;
+    canvas.height = canvas.clientHeight * ratio;
+    const g = canvas.getContext('2d');
+    const css = getComputedStyle(document.documentElement);
+    const { width, height } = canvas;
+    const perPx = (view.b - view.a) / width;
+    const x = take.samples;
+    const xs = (s.start - view.a) / perPx;
+    const xe = (s.end - view.a) / perPx;
+    g.clearRect(0, 0, width, height);
+    g.fillStyle = css.getPropertyValue('--region');
+    g.fillRect(xs, 0, xe - xs, height);
+    let peak = 1e-6;
+    for (let k = view.a; k < view.b; k++) peak = Math.max(peak, Math.abs(x[k]));
+    g.fillStyle = css.getPropertyValue('--wave');
+    for (let px = 0; px < width; px++) {
+      let min = 0;
+      let max = 0;
+      const end = Math.min(view.b, Math.floor(view.a + (px + 1) * perPx));
+      for (let k = Math.floor(view.a + px * perPx); k < end; k++) {
+        if (x[k] < min) min = x[k];
+        if (x[k] > max) max = x[k];
+      }
+      const top = height / 2 - (max / peak) * (height / 2 - 4 * ratio);
+      const bottom = height / 2 - (min / peak) * (height / 2 - 4 * ratio);
+      g.fillRect(px, top, 1, Math.max(1, bottom - top));
+    }
+    // Dim what falls outside the sound, and mark the neighbours you can't cross.
+    g.globalAlpha = 0.6;
+    g.fillStyle = css.getPropertyValue('--surface');
+    g.fillRect(0, 0, xs, height);
+    g.fillRect(xe, 0, width - xe, height);
+    g.globalAlpha = 1;
+    g.fillStyle = css.getPropertyValue('--text-2');
+    for (const limit of [lo, hi]) {
+      if (limit > view.a && limit < view.b) {
+        for (let y = 0; y < height; y += 6 * ratio) g.fillRect((limit - view.a) / perPx, y, ratio, 3 * ratio);
+      }
+    }
+    g.fillStyle = css.getPropertyValue('--accent');
+    const flag = 14 * ratio;
+    g.fillRect(xs - ratio, 0, 2 * ratio, height);
+    g.fillRect(xs, 0, flag, flag);
+    g.fillRect(xe - ratio, 0, 2 * ratio, height);
+    g.fillRect(xe - flag, height - flag, flag, flag);
+    times.textContent = `Start ${(s.start / sr).toFixed(3)} s · End ${(s.end / sr).toFixed(3)} s · Length ${((s.end - s.start) / sr).toFixed(3)} s`;
+  }
+
+  function setEdge(edge, sample) {
+    if (edge === 'start') s.start = Math.max(lo, Math.min(s.end - minLen, sample));
+    else s.end = Math.min(hi, Math.max(s.start + minLen, sample));
+    draw();
+  }
+
+  function commit() {
+    reanalyseSlice(take, s);
+    drawWave(take);
+    row.replaceWith(sliceRow(take, i));
+  }
+
+  // Grab the nearest handle; tapping anywhere moves the nearest handle there.
+  let dragging = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    const box = canvas.getBoundingClientRect();
+    const px = e.clientX - box.left;
+    const toStart = Math.abs(px - toX(s.start));
+    const toEnd = Math.abs(px - toX(s.end));
+    dragging = toStart < toEnd || (toStart === toEnd && px < toX(s.start)) ? 'start' : 'end';
+    canvas.setPointerCapture(e.pointerId);
+    setEdge(dragging, toSample(px));
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (dragging == null) return;
+    setEdge(dragging, toSample(e.clientX - canvas.getBoundingClientRect().left));
+  });
+  const release = () => {
+    if (dragging == null) return;
+    dragging = null;
+    commit();
+  };
+  canvas.addEventListener('pointerup', release);
+  canvas.addEventListener('pointercancel', release);
+
+  const nudge = (edge, sec) => el('button', {
+    type: 'button',
+    className: 'nudge',
+    textContent: sec < 0 ? '◀' : '▶',
+    'aria-label': `Move ${edge} ${sec < 0 ? 'earlier' : 'later'} by ${NUDGE_SEC * 1000} ms`,
+    onclick: () => {
+      setEdge(edge, (edge === 'start' ? s.start : s.end) + Math.round(sec * sr));
+      commit();
+    },
+  });
+  requestAnimationFrame(draw);
+  return el('div', { className: 'details trim-box' },
+    canvas,
+    times,
+    el('div', { className: 'row wrap trim-actions' },
+      el('span', { className: 'nudges' }, 'Start', nudge('start', -NUDGE_SEC), nudge('start', NUDGE_SEC)),
+      el('span', { className: 'nudges' }, 'End', nudge('end', -NUDGE_SEC), nudge('end', NUDGE_SEC)),
+      el('button', { type: 'button', textContent: '▶ Play', onclick: () => playSlice(take, s, row) }),
+      el('button', {
+        type: 'button',
+        className: 'primary',
+        textContent: 'Done',
+        onclick: () => {
+          take.editing = null;
+          row.replaceWith(sliceRow(take, i));
+        },
+      })),
+  );
+}
+
 function sliceRow(take, i) {
   const s = take.slices[i];
-  const row = el('li', { className: `item${s.keep ? '' : ' off'}` });
+  const editing = take.editing === i;
+  const row = el('li', { className: `item${s.keep ? '' : ' off'}${editing ? ' editing' : ''}` });
   const rerender = () => row.replaceWith(sliceRow(take, i));
   const name = el('input', {
     className: 'name',
@@ -432,7 +581,8 @@ function sliceRow(take, i) {
       el('div', { className: 'line1' },
         el('b', { textContent: `#${i + 1} ` }),
         `${(s.start / take.sr).toFixed(2)} s · ${((s.end - s.start) / take.sr).toFixed(2)} s `,
-        s.confirmed ? null : el('span', { className: 'q', textContent: '?' })),
+        s.trimmed ? el('span', { className: 'tag', textContent: 'trimmed' }) : null,
+        s.confirmed ? null : el('span', { className: 'q', textContent: ' ?' })),
       s.analysis.candidates.length > 0
         ? pitchChips(s.analysis.candidates, s.pitchHz, s.confirmed, (hz) => {
           s.pitchHz = hz;
@@ -441,8 +591,21 @@ function sliceRow(take, i) {
         })
         : el('div', { className: 'line2', textContent: 'No pitch found' }),
       name),
-    el('label', { className: 'keep' }, keep, 'Keep'),
+    el('div', { className: 'side' },
+      el('label', { className: 'keep' }, keep, 'Keep'),
+      el('button', {
+        type: 'button',
+        textContent: editing ? 'Close' : 'Trim',
+        'aria-expanded': String(editing),
+        onclick: () => {
+          const open = take.editing;
+          take.editing = editing ? null : i;
+          if (open != null && open !== i) take.list.children[open]?.replaceWith(sliceRow(take, open));
+          rerender();
+        },
+      })),
   );
+  if (editing) row.append(trimEditor(take, i, row));
   return row;
 }
 

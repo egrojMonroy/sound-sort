@@ -1,6 +1,6 @@
-import { analyse, findSounds, formatNote } from './dsp.js?v=3';
-import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=3';
-import { Repo } from './github.js?v=3';
+import { analyse, findSounds, formatNote } from './dsp.js?v=4';
+import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=4';
+import { Repo } from './github.js?v=4';
 
 const LIBRARY_PATH = 'library/sounds.json';
 const SETTINGS_KEY = 'sound-sort.github';
@@ -619,7 +619,11 @@ function setPlaying(id) {
 }
 
 function playOne(s) {
+  const again = state.playingId === s.id;
   stopPlayAll();
+  stopPlayback();
+  setPlaying(null);
+  if (again) return; // a second tap stops it
   setPlaying(s.id);
   playUrl(previewUrl(s), () => setPlaying(null));
 }

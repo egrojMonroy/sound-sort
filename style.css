@@ -12,7 +12,7 @@
   --wave: #a3a19b;
   --region: rgba(42, 100, 214, 0.16);
   --region-line: rgba(42, 100, 214, 0.7);
-  --playing: rgba(42, 100, 214, 0.08);
+  --playing: rgba(42, 100, 214, 0.14);
   color-scheme: light;
 }
 
@@ -31,7 +31,7 @@
     --wave: #6d6c68;
     --region: rgba(111, 156, 242, 0.2);
     --region-line: rgba(111, 156, 242, 0.8);
-    --playing: rgba(111, 156, 242, 0.12);
+    --playing: rgba(111, 156, 242, 0.2);
     color-scheme: dark;
   }
 }
@@ -188,7 +188,10 @@ canvas.wave { width: 100%; height: 120px; display: block; margin: 0.25rem 0 0.75
   border-top: 1px solid var(--line);
 }
 #libList .item { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 0.75rem; margin-bottom: 0.5rem; grid-template-columns: 2rem auto 1fr auto; }
-.item.playing { background: var(--playing); }
+.item.playing,
+#libList .item.playing { background: var(--playing); border-color: var(--accent); box-shadow: inset 4px 0 0 var(--accent); }
+.item.playing .play { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.item.playing .rank { color: var(--accent); font-weight: 650; }
 .item.off { opacity: 0.5; }
 .item .main { min-width: 0; }
 .item .line1 { font-variant-numeric: tabular-nums; }

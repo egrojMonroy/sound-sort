@@ -1,6 +1,6 @@
-import { analyse, findSounds, formatNote } from './dsp.js';
-import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js';
-import { Repo } from './github.js';
+import { analyse, findSounds, formatNote } from './dsp.js?v=3';
+import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=3';
+import { Repo } from './github.js?v=3';
 
 const LIBRARY_PATH = 'library/sounds.json';
 const SETTINGS_KEY = 'sound-sort.github';
@@ -218,6 +218,10 @@ async function toggleRecord() {
 async function onFiles(e) {
   const files = [...e.target.files];
   e.target.value = '';
+  if (files.length === 0) {
+    status('No file was selected. If the file picker did not open, try another browser.', true);
+    return;
+  }
   for (const [i, file] of files.entries()) {
     const which = files.length > 1 ? ` (${i + 1} of ${files.length})` : '';
     status(`Reading ${file.name}${which}…`);
@@ -822,6 +826,7 @@ function init() {
     if (pendingCount() > 0 || takes.length > 0 || mic.recording) e.preventDefault();
   });
 
+  window.soundSortReady = true;
   loadLibrary();
 }
 

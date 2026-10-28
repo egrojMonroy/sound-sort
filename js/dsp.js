@@ -132,6 +132,158 @@ export function pickPeaks(db, binHz, count = 3) {
   return peaks;
 }
 
+// ------------------------------------------------------------------ fundamental (YIN)
+
+const YIN_RATE = 16000;
+const LOW_BAND_RATE = 2400;
+const LOW_BAND_MAX_HZ = 500;
+const YIN_HOP_SEC = 0.016;
+const YIN_THRESHOLD = 0.15;
+export const F0_MIN_HZ = 50;
+export const F0_MAX_HZ = 2000;
+
+// Low-pass and keep every n-th sample, so the period search runs near 16 kHz.
+function decimate(x, sr, rate = YIN_RATE) {
+  const factor = Math.max(1, Math.floor(sr / rate));
+  if (factor === 1) return { y: x, rate: sr };
+  const taps = 47;
+  const cutoff = 0.45 / factor;
+  const h = new Float64Array(taps);
+  let sum = 0;
+  for (let i = 0; i < taps; i++) {
+    const m = i - (taps - 1) / 2;
+    const sinc = m === 0 ? 2 * cutoff : Math.sin(2 * Math.PI * cutoff * m) / (Math.PI * m);
+    h[i] = sinc * (0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (taps - 1)));
+    sum += h[i];
+  }
+  const y = new Float32Array(Math.floor(x.length / factor));
+  for (let j = 0; j < y.length; j++) {
+    const centre = j * factor;
+    let acc = 0;
+    for (let i = 0; i < taps; i++) {
+      const k = centre + i - (taps - 1) / 2;
+      if (k >= 0 && k < x.length) acc += x[k] * h[i];
+    }
+    y[j] = acc / sum;
+  }
+  return { y, rate: sr / factor };
+}
+
+// Frame-by-frame fundamental with YIN (de Cheveigné & Kawahara, 2002).
+// Each frame gives f0 (Hz) and aperiodicity (0 = perfectly periodic, 1 = noise).
+export function yinTrack(x, sr, { lowBand = false } = {}) {
+  // The low band (below ~1 kHz) hears a low voice through breath noise.
+  const { y, rate } = decimate(x, sr, lowBand ? LOW_BAND_RATE : YIN_RATE);
+  const tauMin = Math.max(2, Math.floor(rate / (lowBand ? LOW_BAND_MAX_HZ : F0_MAX_HZ)));
+  const tauMax = Math.ceil(rate / F0_MIN_HZ);
+  const frames = [];
+  const d = new Float64Array(tauMax + 2);
+  const cmnd = new Float64Array(tauMax + 2);
+  const window = tauMax + 1; // at least one period of the lowest note
+  const hop = Math.max(1, Math.round(YIN_HOP_SEC * rate));
+  for (let t = 0; t + window + tauMax + 1 <= y.length; t += hop) {
+    let energy = 0;
+    for (let j = 0; j < window; j++) energy += y[t + j] * y[t + j];
+    for (let tau = 1; tau <= tauMax + 1; tau++) {
+      let acc = 0;
+      for (let j = 0; j < window; j++) {
+        const diff = y[t + j] - y[t + j + tau];
+        acc += diff * diff;
+      }
+      d[tau] = acc;
+    }
+    let running = 0;
+    for (let tau = 1; tau <= tauMax + 1; tau++) {
+      running += d[tau];
+      cmnd[tau] = running > 0 ? (d[tau] * tau) / running : 1;
+    }
+    let best = -1;
+    for (let tau = tauMin; tau <= tauMax; tau++) {
+      if (cmnd[tau] < YIN_THRESHOLD) {
+        while (tau + 1 <= tauMax && cmnd[tau + 1] < cmnd[tau]) tau++;
+        best = tau;
+        break;
+      }
+    }
+    if (best < 0) {
+      best = tauMin;
+      for (let tau = tauMin; tau <= tauMax; tau++) if (cmnd[tau] < cmnd[best]) best = tau;
+    }
+    const [a, b, c] = [cmnd[best - 1], cmnd[best], cmnd[best + 1]];
+    const curve = a - 2 * b + c;
+    const offset = best > tauMin && best < tauMax && curve > 0 ? (0.5 * (a - c)) / curve : 0;
+    frames.push({
+      time: (t + window / 2) / rate,
+      f0: rate / (best + offset),
+      aperiodicity: Math.min(1, b),
+      rms: Math.sqrt(energy / window),
+    });
+  }
+  return frames;
+}
+
+// The fundamental of the loud part of a sound, and how much of it repeats regularly.
+// Tries the full band first, then the low band; keeps whichever repeats more regularly.
+export function findFundamental(x, sr) {
+  const full = yinTrack(x, sr);
+  const fullSummary = summariseTrack(full);
+  if (fullSummary.periodicity >= 0.5) return { ...fullSummary, track: full };
+  const low = yinTrack(x, sr, { lowBand: true });
+  const lowSummary = summariseTrack(low);
+  return lowSummary.periodicity > fullSummary.periodicity
+    ? { ...lowSummary, track: low }
+    : { ...fullSummary, track: full };
+}
+
+export function summariseTrack(frames) {
+  const loudest = frames.reduce((m, f) => Math.max(m, f.rms), 0);
+  const loud = frames.filter((f) => f.rms > loudest * 10 ** (-25 / 20));
+  const voiced = loud.filter((f) => f.aperiodicity < 0.25);
+  if (loud.length === 0 || voiced.length === 0) return { f0Hz: null, periodicity: 0 };
+  const sorted = voiced.map((f) => f.f0).sort((p, q) => p - q);
+  return { f0Hz: sorted[sorted.length >> 1], periodicity: voiced.length / loud.length };
+}
+
+// How clearly a spectrum (dB per bin) shows a harmonic series on f0:
+// the average height of the peaks at f0, 2·f0, 3·f0… above the floor around each one.
+const HARMONIC_TOP_HZ = 5000;
+const HARMONIC_COUNT = 10;
+
+export function harmonicSupport(db, binHz, f0) {
+  let total = 0;
+  let count = 0;
+  for (let k = 1; k <= HARMONIC_COUNT && k * f0 <= HARMONIC_TOP_HZ; k++) {
+    const centre = k * f0;
+    const peakLo = Math.floor((centre * 0.97) / binHz);
+    const peakHi = Math.ceil((centre * 1.03) / binHz);
+    const floorLo = Math.max(1, Math.floor((centre - 0.5 * f0) / binHz));
+    const floorHi = Math.min(db.length - 1, Math.ceil((centre + 0.5 * f0) / binHz));
+    if (peakHi >= db.length) break;
+    let peak = -Infinity;
+    for (let i = peakLo; i <= peakHi; i++) peak = Math.max(peak, db[i]);
+    const around = Array.from(db.subarray(floorLo, floorHi + 1)).sort((a, b) => a - b);
+    const floor = around[around.length >> 1];
+    total += Math.max(0, Math.min(30, peak - floor));
+    count++;
+  }
+  return count >= 3 ? total / count : 0;
+}
+
+// Octave check: noisy low notes can be read an octave (or two) too low.
+// If f0·2 explains the spectrum better than f0, the note is an octave higher.
+export function correctOctave(db, binHz, f0) {
+  let best = f0;
+  let bestScore = harmonicSupport(db, binHz, f0);
+  for (const factor of [2, 4]) {
+    const score = harmonicSupport(db, binHz, f0 * factor);
+    if (f0 * factor <= F0_MAX_HZ && score > bestScore + 2) {
+      best = f0 * factor;
+      bestScore = score;
+    }
+  }
+  return { f0Hz: best, support: bestScore };
+}
+
 function nextPow2(n) {
   return 2 ** Math.ceil(Math.log2(Math.max(n, 1)));
 }
@@ -162,11 +314,74 @@ export function analyse(seg, sr) {
   const hi = Math.min(n / 2, Math.floor(PITCH_MAX_HZ / binHz));
   const band = weighted.slice(lo, hi).sort();
   const median = band[band.length >> 1] ?? 0;
+  const raw = new Float32Array(n / 2);
+  for (let k = 0; k < n / 2; k++) raw[k] = 20 * Math.log10(Math.hypot(re[k], im[k]) + 1e-12);
+  const { f0Hz: yinF0, periodicity } = findFundamental(seg, sr);
+  const fundamental = yinF0 != null ? correctOctave(raw, binHz, yinF0) : { f0Hz: null, support: 0 };
+  // Spectral median: half the energy lies below it (CDP's "brightness").
+  let half = 0;
+  for (let k = lo; k < n / 2; k++) half += Math.hypot(re[k], im[k]);
+  half /= 2;
+  let medianHz = null;
+  for (let k = lo, acc = 0; k < n / 2; k++) {
+    acc += Math.hypot(re[k], im[k]);
+    if (acc >= half) {
+      medianHz = k * binHz;
+      break;
+    }
+  }
+  const peaks = pickPeaks(weighted, binHz).map((p) => ({ hz: p.hz, prominenceDb: p.db - median, source: 'peak' }));
+  const kind = classify(fundamental.f0Hz, periodicity, fundamental.support, peaks[0]?.prominenceDb ?? 0);
+  const candidates = [
+    ...(fundamental.f0Hz != null && kind === 'note' ? [{ hz: fundamental.f0Hz, prominenceDb: fundamental.support, source: 'fundamental' }] : []),
+    ...peaks.filter((p) => kind !== 'note' || Math.abs(12 * Math.log2(p.hz / fundamental.f0Hz)) >= 0.5),
+    ...(medianHz != null ? [{ hz: medianHz, prominenceDb: 0, source: 'brightness' }] : []),
+  ];
+  const register = { note: candidates[0], node: peaks[0], noise: candidates[candidates.length - 1] }[kind];
   return {
-    candidates: pickPeaks(weighted, binHz).map((p) => ({ hz: p.hz, prominenceDb: p.db - median })),
+    candidates,
+    defaultHz: register?.hz ?? null,
+    kind,
     centroidHz: den > 0 ? num / den : null,
+    medianHz,
+    f0Hz: fundamental.f0Hz,
+    periodicity,
+    harmonicDb: fundamental.support,
     peak,
   };
+}
+
+// Smalley's note / node / noise, measured:
+// note  = a fundamental with a clear harmonic series (voice, strings, most instruments, ringing objects);
+// node  = no harmonic series, but one frequency clearly stands out (bells, metal, glass);
+// noise = neither; its register is the spectral median.
+const NOTE_HARMONIC_DB = 12;
+const NOTE_PERIODICITY = 0.2;
+const NODE_PROMINENCE_DB = 25;
+
+function classify(f0Hz, periodicity, harmonicDb, topProminenceDb) {
+  if (f0Hz != null && harmonicDb >= NOTE_HARMONIC_DB && periodicity >= NOTE_PERIODICITY) return 'note';
+  if (topProminenceDb >= NODE_PROMINENCE_DB) return 'node';
+  return 'noise';
+}
+
+// Short-time spectrum for drawing: dB frames, at most maxFrames of them.
+export function spectrogram(x, sr, maxFrames = 300) {
+  const size = 2048;
+  const hop = Math.max(128, Math.ceil(Math.max(1, x.length - size) / maxFrames));
+  const window = Float64Array.from({ length: size }, (_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (size - 1)));
+  const frames = [];
+  for (let t = 0; t === 0 || t + size <= x.length; t += hop) {
+    const re = new Float64Array(size);
+    const im = new Float64Array(size);
+    for (let i = 0; i < size && t + i < x.length; i++) re[i] = x[t + i] * window[i];
+    fft(re, im);
+    const db = new Float32Array(size / 2);
+    for (let k = 0; k < size / 2; k++) db[k] = 20 * Math.log10(Math.hypot(re[k], im[k]) + 1e-9);
+    frames.push(db);
+    if (t + size >= x.length) break;
+  }
+  return { frames, binHz: sr / size, hopSec: hop / sr };
 }
 
 const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];

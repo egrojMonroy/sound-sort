@@ -1,6 +1,6 @@
 // Microphone, file decoding, preview encoding and playback.
 
-import { aWeightDb, pickPeaks, toMono } from './dsp.js?v=6';
+import { aWeightDb, pickPeaks, toMono } from './dsp.js?v=7';
 
 export const PREVIEW_SR = 24000;
 const FADE_SEC = 0.005;
@@ -155,20 +155,53 @@ export function stopPlayback() {
   current = null;
 }
 
-export function playSamples(seg, sr, onEnd) {
+// A plain sine at hz, to compare with a sound by ear.
+function startTone(ctx, hz, seconds) {
+  const now = ctx.currentTime;
+  const gain = new GainNode(ctx, { gain: 0 });
+  gain.gain.linearRampToValueAtTime(0.18, now + 0.03);
+  gain.gain.setValueAtTime(0.18, now + seconds - 0.08);
+  gain.gain.linearRampToValueAtTime(0, now + seconds);
+  const osc = new OscillatorNode(ctx, { type: 'sine', frequency: hz });
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + seconds);
+  return osc;
+}
+
+// Plays a sound, a reference tone at toneHz, or both together.
+export function playSamples(seg, sr, onEnd, { toneHz = null, sound = true } = {}) {
   stopPlayback();
   playCtx ??= new AudioContext();
-  const buffer = playCtx.createBuffer(1, seg.length, sr);
-  buffer.copyToChannel(Float32Array.from(seg), 0);
-  const node = new AudioBufferSourceNode(playCtx, { buffer });
-  node.connect(playCtx.destination);
-  const handle = { stop: () => node.stop() };
-  node.onended = () => {
-    if (current === handle) current = null;
-    onEnd?.();
-  };
-  node.start();
+  const nodes = [];
+  if (sound) {
+    const buffer = playCtx.createBuffer(1, seg.length, sr);
+    buffer.copyToChannel(Float32Array.from(seg), 0);
+    const node = new AudioBufferSourceNode(playCtx, { buffer });
+    node.connect(playCtx.destination);
+    node.start();
+    nodes.push(node);
+  }
+  if (toneHz != null) nodes.push(startTone(playCtx, toneHz, Math.max(1, sound ? seg.length / sr : 1.2)));
+  let left = nodes.length;
+  const handle = { stop: () => nodes.forEach((n) => n.stop()) };
+  for (const node of nodes) {
+    node.onended = () => {
+      if (--left > 0) return;
+      if (current === handle) current = null;
+      onEnd?.();
+    };
+  }
   current = handle;
+}
+
+export async function decodeUrl(url) {
+  const bytes = await fetch(url).then((r) => {
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.arrayBuffer();
+  });
+  const buffer = await new OfflineAudioContext(1, 1, PREVIEW_SR).decodeAudioData(bytes);
+  return { samples: toMono(buffer), sr: buffer.sampleRate };
 }
 
 export function playUrl(url, onEnd) {

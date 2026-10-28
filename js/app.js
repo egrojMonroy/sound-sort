@@ -1,6 +1,7 @@
-import { analyse, findSounds, formatNote } from './dsp.js?v=6';
-import { Mic, decodeFile, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=6';
-import { Repo } from './github.js?v=6';
+import { analyse, findSounds, formatNote } from './dsp.js?v=7';
+import { Mic, decodeFile, decodeUrl, makePreview, playSamples, playUrl, sha256Hex, stopPlayback } from './audio.js?v=7';
+import { Repo } from './github.js?v=7';
+import { KINDS, pitchEditor } from './pitch-editor.js?v=7';
 
 const LIBRARY_PATH = 'library/sounds.json';
 const SETTINGS_KEY = 'sound-sort.github';
@@ -39,6 +40,7 @@ const state = {
   openId: null,
   playingId: null,
   selecting: false,
+  libEditor: null,
   selected: new Set(),
 };
 
@@ -369,7 +371,8 @@ async function analyseTake(take) {
       start,
       end,
       analysis,
-      pitchHz: old?.pitchHz ?? analysis.candidates[0]?.hz ?? null,
+      pitchHz: old?.pitchHz ?? analysis.defaultHz,
+      kind: old?.kind ?? analysis.kind,
       confirmed: old?.confirmed ?? false,
       keep: old?.keep ?? true,
       name: old?.name ?? '',
@@ -378,6 +381,8 @@ async function analyseTake(take) {
   if (generation !== take.generation) return;
   take.slices = [...slices, ...trimmed].sort((a, b) => a.start - b.start);
   take.editing = null;
+  take.pitching = null;
+  take.pitchNode = null;
   const seconds = (take.samples.length / take.sr).toFixed(1);
   take.info.textContent = take.slices.length === 1
     ? `${seconds} s · 1 sound.`
@@ -432,16 +437,17 @@ function drawWave(take) {
   }
 }
 
+const CANDIDATE_LABELS = { fundamental: 'fundamental', peak: 'peak', brightness: 'brightness' };
+
 function pitchChips(candidates, chosenHz, confirmed, onPick) {
   return el('div', { className: 'chips' }, ...candidates.map((c) => {
     const on = chosenHz != null && Math.abs(c.hz - chosenHz) < 0.01;
     return el('button', {
       type: 'button',
       className: `chip${on ? ' on' : ''}${on && !confirmed ? ' unsure' : ''}`,
-      textContent: `${formatNote(c.hz)} · ${Math.round(c.hz)} Hz`,
-      title: `Stands ${Math.round(c.prominenceDb)} dB above the rest of the sound`,
+      title: c.source === 'brightness' ? 'Half of the energy lies below this frequency' : `Stands ${Math.round(c.prominenceDb)} dB out`,
       onclick: () => onPick(c.hz),
-    });
+    }, `${formatNote(c.hz)} · ${Math.round(c.hz)} Hz `, el('small', { textContent: CANDIDATE_LABELS[c.source] ?? '' }));
   }));
 }
 
@@ -460,10 +466,23 @@ function reanalyseSlice(take, s) {
     ? null
     : analysis.candidates.find((c) => Math.abs(12 * Math.log2(c.hz / s.pitchHz)) < 0.5);
   s.analysis = analysis;
-  s.pitchHz = same?.hz ?? analysis.candidates[0]?.hz ?? null;
+  if (!s.kindChosen) s.kind = analysis.kind;
+  s.pitchHz = same?.hz ?? analysis.defaultHz;
   s.confirmed = same != null && s.confirmed;
   s.trimmed = true;
+  take.pitchNode = null; // the editor shows the old cut
 }
+
+// What each type sorts by, for a sound's candidates.
+function kindDefaults(candidates) {
+  return {
+    note: candidates.find((c) => c.source === 'fundamental')?.hz,
+    node: candidates.find((c) => c.source === 'peak')?.hz,
+    noise: candidates.find((c) => c.source === 'brightness')?.hz,
+  };
+}
+
+const kindTag = (kind) => (kind != null ? el('span', { className: `tag kind-${kind}`, textContent: KINDS[kind].label.toLowerCase() }) : null);
 
 // Zoomed waveform of one sound with draggable start and end handles.
 function trimEditor(take, i, row) {
@@ -598,7 +617,8 @@ function sliceRow(take, i) {
   const s = take.slices[i];
   const editing = take.editing === i;
   const row = el('li', { className: `item${s.keep ? '' : ' off'}${editing ? ' editing' : ''}` });
-  const rerender = () => row.replaceWith(sliceRow(take, i));
+  // Always replace the row that is on screen now; callbacks can outlive the row that created them.
+  const rerender = () => (take.list.children[i] ?? row).replaceWith(sliceRow(take, i));
   const name = el('input', {
     className: 'name',
     value: s.name,
@@ -616,37 +636,57 @@ function sliceRow(take, i) {
       updateReviewSummary();
     },
   });
+  const pitching = take.pitching === i;
+  const toggleEditor = (which) => () => {
+    for (const key of ['editing', 'pitching']) {
+      const open = take[key];
+      if (open != null && open !== i) {
+        take[key] = null;
+        take.list.children[open]?.replaceWith(sliceRow(take, open));
+      }
+    }
+    take[which] = take[which] === i ? null : i;
+    if (which === 'pitching') take.pitchNode = null;
+    rerender();
+  };
   row.append(
     el('button', { type: 'button', className: 'play', textContent: '▶', 'aria-label': 'Play', onclick: () => playSlice(take, s, row) }),
     el('div', { className: 'main' },
       el('div', { className: 'line1' },
         el('b', { textContent: `#${i + 1} ` }),
         `${(s.start / take.sr).toFixed(2)} s · ${((s.end - s.start) / take.sr).toFixed(2)} s `,
+        kindTag(s.kind),
         s.trimmed ? el('span', { className: 'tag', textContent: 'trimmed' }) : null,
         s.confirmed ? null : el('span', { className: 'q', textContent: ' ?' })),
-      s.analysis.candidates.length > 0
-        ? pitchChips(s.analysis.candidates, s.pitchHz, s.confirmed, (hz) => {
+      pitching || s.analysis.candidates.length === 0
+        ? null
+        : pitchChips(s.analysis.candidates, s.pitchHz, s.confirmed, (hz) => {
           s.pitchHz = hz;
           s.confirmed = true;
           rerender();
-        })
-        : el('div', { className: 'line2', textContent: 'No pitch found' }),
+        }),
       name),
     el('div', { className: 'side' },
       el('label', { className: 'keep' }, keep, 'Keep'),
-      el('button', {
-        type: 'button',
-        textContent: editing ? 'Close' : 'Trim',
-        'aria-expanded': String(editing),
-        onclick: () => {
-          const open = take.editing;
-          take.editing = editing ? null : i;
-          if (open != null && open !== i) take.list.children[open]?.replaceWith(sliceRow(take, open));
-          rerender();
-        },
-      })),
+      el('button', { type: 'button', textContent: pitching ? 'Close' : 'Pitch', 'aria-expanded': String(pitching), onclick: toggleEditor('pitching') }),
+      el('button', { type: 'button', textContent: editing ? 'Close' : 'Trim', 'aria-expanded': String(editing), onclick: toggleEditor('editing') })),
   );
   if (editing) row.append(trimEditor(take, i, row));
+  if (pitching) {
+    // The editor survives row refreshes, so the spectrogram isn't rebuilt on every change.
+    take.pitchNode ??= pitchEditor({
+      loadAudio: async () => ({ samples: take.samples.subarray(s.start, s.end), sr: take.sr }),
+      candidates: s.analysis.candidates,
+      defaults: kindDefaults(s.analysis.candidates),
+      value: { pitchHz: s.pitchHz, confirmed: s.confirmed, kind: s.kind },
+      onChange: (v) => {
+        if (v.kind !== s.kind) s.kindChosen = true;
+        Object.assign(s, v);
+        rerender();
+      },
+    });
+    row.append(take.pitchNode);
+  }
   return row;
 }
 
@@ -686,7 +726,12 @@ async function addTakesToLibrary() {
         added: today(),
         pitchHz: round(s.pitchHz, 2),
         pitchConfirmed: s.confirmed,
-        candidates: s.analysis.candidates.map((c) => ({ hz: round(c.hz, 2), prominenceDb: round(c.prominenceDb, 1) })),
+        kind: s.kind,
+        candidates: s.analysis.candidates.map((c) => ({ hz: round(c.hz, 2), prominenceDb: round(c.prominenceDb, 1), source: c.source })),
+        f0Hz: round(s.analysis.f0Hz, 2),
+        periodicity: round(s.analysis.periodicity, 2),
+        harmonicDb: round(s.analysis.harmonicDb, 1),
+        medianHz: round(s.analysis.medianHz, 1),
         centroidHz: round(s.analysis.centroidHz, 1),
         peak: round(s.analysis.peak, 4),
         notes: '',
@@ -714,7 +759,8 @@ async function addTakesToLibrary() {
 function sortedSounds(doc) {
   const order = $('orderSel').value;
   const source = $('sourceSel').value;
-  let sounds = doc.sounds.filter((s) => source === '' || s.source === source);
+  const kind = $('kindSel').value;
+  let sounds = doc.sounds.filter((s) => (source === '' || s.source === source) && (kind === '' || s.kind === kind));
   if (order.startsWith('saved:')) {
     const byId = new Map(sounds.map((s) => [s.id, s]));
     return doc.sorts[Number(order.slice(6))].ids.map((id) => byId.get(id)).filter((s) => s != null);
@@ -786,10 +832,7 @@ function libraryRow(s, index) {
       : el('span', { className: 'rank', textContent: String(index + 1) }),
     el('button', { type: 'button', className: 'play', textContent: '▶', 'aria-label': 'Play', onclick: () => playOne(s) }),
     el('div', { className: 'main' },
-      el('div', { className: 'line1' },
-        el('b', { textContent: formatNote(s.pitchHz) }),
-        s.pitchHz != null ? ` · ${s.pitchHz.toFixed(1)} Hz ` : ' ',
-        s.pitchConfirmed ? null : el('span', { className: 'q', textContent: '?', title: 'Pitch not confirmed by ear' })),
+      libraryLine1(s),
       el('div', { className: 'line2', textContent: s.name }),
       el('div', {
         className: 'line2',
@@ -804,19 +847,49 @@ function libraryRow(s, index) {
       textContent: open ? 'Close' : 'Edit',
       onclick: () => {
         state.openId = open ? null : s.id;
-        renderLibrary();
+        state.libEditor = null;
+        renderLibrary(); // re-sorts with any new pitch once the editor closes
       },
     }),
   );
-  if (open && !state.selecting) row.append(libraryDetails(s));
+  if (open && !state.selecting) row.append(libraryDetails(s, row));
   return row;
 }
 
-function libraryDetails(s) {
+function libraryLine1(s) {
+  return el('div', { className: 'line1' },
+    el('b', { textContent: `${s.kind === 'noise' ? '≈ ' : ''}${formatNote(s.pitchHz)}` }),
+    s.pitchHz != null ? ` · ${s.pitchHz.toFixed(1)} Hz ` : ' ',
+    kindTag(s.kind),
+    s.pitchConfirmed ? null : el('span', { className: 'q', textContent: ' ?', title: 'Pitch not confirmed by ear' }));
+}
+
+// Pitch edits stay where they are while you work; the list re-sorts when you close the editor.
+function editPitchQuietly(s, row, fields) {
+  state.pending.edits.set(s.id, { ...(state.pending.edits.get(s.id) ?? {}), ...fields });
+  Object.assign(s, fields);
+  row.querySelector('.line1')?.replaceWith(libraryLine1(s));
+  const changes = pendingCount();
+  $('saveBar').hidden = changes === 0;
+  $('saveText').textContent = `${changes} unsaved change${changes === 1 ? '' : 's'}`;
+}
+
+function libraryDetails(s, row) {
+  if (state.libEditor?.id !== s.id) {
+    state.libEditor = {
+      id: s.id,
+      node: pitchEditor({
+        loadAudio: () => decodeUrl(previewUrl(s)),
+        candidates: s.candidates,
+        defaults: kindDefaults(s.candidates),
+        value: { pitchHz: s.pitchHz, confirmed: s.pitchConfirmed, kind: s.kind ?? 'node' },
+        onChange: (v) => editPitchQuietly(s, state.libEditor.row, { pitchHz: round(v.pitchHz, 2), pitchConfirmed: v.confirmed, kind: v.kind }),
+      }),
+    };
+  }
+  state.libEditor.row = row;
   return el('div', { className: 'details' },
-    s.candidates.length > 0
-      ? pitchChips(s.candidates, s.pitchHz, s.pitchConfirmed, (hz) => editSound(s.id, { pitchHz: hz, pitchConfirmed: true }))
-      : null,
+    state.libEditor.node,
     el('label', { className: 'field', style: 'margin-top:0.75rem' }, 'Name',
       el('input', { value: s.name, onchange: (e) => editSound(s.id, { name: e.target.value.trim() || s.name }) })),
     el('label', { className: 'field' }, 'Notes',
@@ -1040,6 +1113,7 @@ function init() {
 
   $('orderSel').addEventListener('change', renderLibrary);
   $('sourceSel').addEventListener('change', renderLibrary);
+  $('kindSel').addEventListener('change', renderLibrary);
   $('btnPlayAll').addEventListener('click', togglePlayAll);
   $('btnSaveOrder').addEventListener('click', saveOrder);
   $('btnExport').addEventListener('click', exportZip);
